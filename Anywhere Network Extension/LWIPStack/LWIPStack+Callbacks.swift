@@ -34,13 +34,30 @@ extension LWIPStack {
             }
         }
 
-        // TCP accept: create a new LWIPTCPConnection for each incoming connection
-        lwip_bridge_set_tcp_accept_fn { srcIP, srcPort, dstIP, dstPort, isIPv6, pcb in
+        // TCP pre-accept: gate on routing decision *before* SYN-ACK is sent.
+        //
+        // The pre-accept hook runs from inside the patched `tcp_listen_input`
+        // (see ANYWHERE_PATCHES.md "deferred SYN-ACK"). For each new SYN we
+        // pick one of:
+        //   ALLOW  (0) — proceed with normal SYN-ACK now. Used for SNI-sniff
+        //                connections where we need the local app to actually
+        //                send the ClientHello before we know the route.
+        //   DEFER  (1) — hold the SYN_RCVD PCB; we'll dial upstream first and
+        //                only emit SYN-ACK once that succeeds. A failed dial
+        //                surfaces to the local app's connect(2) as a real
+        //                ECONNREFUSED instead of a mid-stream RST.
+        //   REJECT (2) — abandon now (RST), used for routing-rule rejects and
+        //                drop/unreachable fake-IP states.
+        lwip_bridge_set_tcp_pre_accept_fn { srcIP, srcPort, dstIP, dstPort, isIPv6, pcb, outDecision, outConn in
+            // Default to REJECT so any early-out below sends RST.
+            outDecision?.pointee = 2
+            outConn?.pointee = nil
+
             guard let shared = LWIPStack.shared,
                   let pcb, let dstIP,
                   let defaultConfiguration = shared.configuration else {
-                logger.debug("[LWIPStack] tcp_accept: guard failed")
-                return nil
+                logger.debug("[LWIPStack] tcp_pre_accept: guard failed")
+                return
             }
 
             let dstIPString = LWIPStack.ipAddrToString(dstIP, isIPv6: isIPv6 != 0)
@@ -63,7 +80,7 @@ extension LWIPStack {
                         forceBypass = true
                     case .reject:
                         logger.debug("[TCP] IP rejected by routing rule: \(dstIPString):\(dstPort)")
-                        return nil
+                        return
                     case .proxy(_):
                         if var configuration = shared.domainRouter.resolveConfiguration(action: action) {
                             if let chain = defaultConfiguration.chain, !chain.isEmpty, configuration.chain == nil {
@@ -86,8 +103,14 @@ extension LWIPStack {
                 }
                 forceBypass = bypass
             case .drop, .unreachable:
-                return nil
+                return
             }
+
+            // SNI sniff requires bytes from the local app, which means we must
+            // accept the inner handshake first. Everything else has a fully
+            // determined route — defer the SYN-ACK so a connect failure can
+            // surface as a clean ECONNREFUSED.
+            let deferAccept = !sniffSNI
 
             let connection = LWIPTCPConnection(
                 pcb: pcb,
@@ -96,9 +119,11 @@ extension LWIPStack {
                 configuration: connectionConfiguration,
                 forceBypass: forceBypass,
                 sniffSNI: sniffSNI,
+                deferred: deferAccept,
                 lwipQueue: shared.lwipQueue
             )
-            return Unmanaged.passRetained(connection).toOpaque()
+            outDecision?.pointee = deferAccept ? 1 : 0
+            outConn?.pointee = Unmanaged.passRetained(connection).toOpaque()
         }
 
         // TCP recv: deliver data to the connection

@@ -125,8 +125,17 @@ err_t            tcp_process_refused_data(struct tcp_pcb *pcb);
 #define TCP_SLOW_INTERVAL      (2*TCP_TMR_INTERVAL)  /* the coarse grained timeout in milliseconds */
 #endif /* TCP_SLOW_INTERVAL */
 
+/* --- BEGIN Anywhere Patch: ifndef-guard timeout overrides --- */
+/* Allow lwipopts.h to override these without -Wmacro-redefined warnings.
+ * Used by the deferred SYN-ACK patch to align TCP_SYN_RCVD_TIMEOUT with our
+ * TunnelConstants.handshakeTimeout. */
+#ifndef TCP_FIN_WAIT_TIMEOUT
 #define TCP_FIN_WAIT_TIMEOUT 20000 /* milliseconds */
+#endif
+#ifndef TCP_SYN_RCVD_TIMEOUT
 #define TCP_SYN_RCVD_TIMEOUT 20000 /* milliseconds */
+#endif
+/* --- END Anywhere Patch --- */
 
 #define TCP_OOSEQ_TIMEOUT        6U /* x RTO */
 

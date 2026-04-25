@@ -71,6 +71,13 @@
 #define TCP_WND_UPDATE_THRESHOLD        LWIP_MIN((TCP_WND / 4), (TCP_MSS * 8))
 #define TCP_MAXRTX                      8
 #define TCP_SYNMAXRTX                   3
+/* Backstop timeout for SYN_RCVD PCBs whose SYN-ACK we deferred while dialing
+ * upstream. Must exceed TunnelConstants.handshakeTimeout (60 s) so the Swift
+ * handshake timer fires first and tears the connection down through our own
+ * path; otherwise lwIP's tcp_slowtmr would purge the PCB with ERR_ABRT and
+ * fire tcp_err out from under an in-flight dial. See ANYWHERE_PATCHES.md
+ * "deferred SYN-ACK". */
+#define TCP_SYN_RCVD_TIMEOUT            75000 /* ms */
 #define LWIP_TCP_TIMESTAMPS             0
 #define LWIP_TCP_SACK_OUT               0
 #define LWIP_TCP_CALC_INITIAL_CWND(mss) ((tcpwnd_size_t)(32U * (mss)))

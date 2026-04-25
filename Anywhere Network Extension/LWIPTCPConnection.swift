@@ -31,6 +31,14 @@ class LWIPTCPConnection {
     private var pendingData = Data()
     private var closed = false
 
+    /// True when the inner SYN-ACK was held back in `tcp_listen_input`
+    /// (see ANYWHERE_PATCHES.md "deferred SYN-ACK"). The first successful
+    /// upstream connect must call `lwip_bridge_tcp_complete_accept` to release
+    /// it; a connect failure must call `lwip_bridge_tcp_reject_accept`. Flips
+    /// to `false` once the SYN-ACK has been emitted, after which behavior
+    /// matches the legacy ALLOW path (failures abort the live PCB).
+    private var deferredAccept: Bool
+
     // MARK: SNI Sniffing
     //
     // When present, the connection is in the "sniff" phase: inbound bytes are
@@ -102,6 +110,7 @@ class LWIPTCPConnection {
     init(pcb: UnsafeMutableRawPointer, dstHost: String, dstPort: UInt16,
          configuration: ProxyConfiguration, forceBypass: Bool = false,
          sniffSNI: Bool = false,
+         deferred: Bool = false,
          lwipQueue: DispatchQueue) {
         self.pcb = pcb
         self.dstHost = dstHost
@@ -109,6 +118,7 @@ class LWIPTCPConnection {
         self.configuration = configuration
         self.lwipQueue = lwipQueue
         self.bypass = forceBypass || (LWIPStack.shared?.shouldBypass(host: dstHost) == true)
+        self.deferredAccept = deferred
         if sniffSNI {
             self.sniffer = TLSClientHelloSniffer()
         }
@@ -406,6 +416,36 @@ class LWIPTCPConnection {
         )
     }
 
+    /// Logs an upstream-connect failure, picking a level based on whether
+    /// SYN-ACK has already been sent, then aborts.
+    ///
+    /// - Deferred path (no SYN-ACK yet): demoted to `debug`. `abort()` will
+    ///   answer the held SYN with a RST, surfacing as `ECONNREFUSED` to the
+    ///   local app — nothing failed mid-conversation, so the noisy `[TCP]
+    ///   Connect failed:` line buys the user nothing.
+    /// - Legacy path (SYN-ACK already out, e.g. SNI sniff): same `error`-level
+    ///   line as before. The inner connection is live, so we still have to
+    ///   abort it, and the user has a real "connection died mid-flight" event.
+    private func handleConnectFailure(_ error: Error) {
+        guard !closed else { return }
+        if deferredAccept {
+            logger.debug("[TCP] Upstream dial failed (pre-accept): \(endpointDescription): \(error.localizedDescription)")
+        } else {
+            logTransportFailure("Connect", error: error)
+        }
+        abort()
+    }
+
+    /// Releases the SYN-ACK we held back in `tcp_listen_input`. No-op in the
+    /// legacy ALLOW path since `deferredAccept` was never set. Must be called
+    /// on `lwipQueue` before any `tcp_write` so lwIP enqueues SYN-ACK ahead of
+    /// the first data segment.
+    private func emitDeferredSynAck() {
+        guard deferredAccept, !closed else { return }
+        deferredAccept = false
+        lwip_bridge_tcp_complete_accept(pcb)
+    }
+
     // MARK: - Route Commit
 
     /// Kicks off the outbound connection using the currently committed
@@ -494,10 +534,10 @@ class LWIPTCPConnection {
                 guard !self.closed else { return }
 
                 if let error {
-                    self.logTransportFailure("Connect", error: error)
-                    self.abort()
+                    self.handleConnectFailure(error)
                     return
                 }
+                self.emitDeferredSynAck()
                 self.handshakeTimer?.cancel()
                 self.handshakeTimer = nil
                 self.activityTimer = ActivityTimer(
@@ -591,6 +631,7 @@ class LWIPTCPConnection {
                 switch result {
                 case .success(let proxyConnection):
                     self.proxyConnection = proxyConnection
+                    self.emitDeferredSynAck()
                     self.handshakeTimer?.cancel()
                     self.handshakeTimer = nil
                     self.activityTimer = ActivityTimer(
@@ -627,8 +668,7 @@ class LWIPTCPConnection {
                     self.tryArmReceive()
 
                 case .failure(let error):
-                    self.logTransportFailure("Connect", error: error)
-                    self.abort()
+                    self.handleConnectFailure(error)
                 }
             }
         }
@@ -839,7 +879,15 @@ class LWIPTCPConnection {
     func abort() {
         guard !closed else { return }
         closed = true
-        lwip_bridge_tcp_abort(pcb)
+        if deferredAccept {
+            // SYN-ACK was never emitted — answer the held SYN with a RST so
+            // the local app's connect(2) sees ECONNREFUSED instead of a
+            // mid-stream reset.
+            deferredAccept = false
+            lwip_bridge_tcp_reject_accept(pcb)
+        } else {
+            lwip_bridge_tcp_abort(pcb)
+        }
         releaseProxy()
         Unmanaged.passUnretained(self).release()
     }

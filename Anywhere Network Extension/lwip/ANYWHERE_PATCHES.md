@@ -102,7 +102,104 @@ in `src/core/tcp_out.c` inside `tcp_output()`.
 
 ---
 
-### 2. `src/include/lwip/priv/tcp_priv.h` — disable delayed ACK
+### 2. `src/core/tcp_in.c` — deferred SYN-ACK for outbound dial gating
+
+**What:** Insert a hook in `tcp_listen_input`, after the new SYN_RCVD PCB is
+allocated and parsed but *before* `tcp_enqueue_flags(npcb, TCP_SYN | TCP_ACK)`,
+that calls back into the bridge (`lwip_bridge_handle_pre_accept(npcb)`) and
+acts on its return:
+
+```
+0 (ALLOW)  → fall through to the normal SYN-ACK enqueue (legacy behavior).
+1 (DEFER)  → return early. PCB stays in SYN_RCVD with empty unsent/unacked.
+             Bridge later calls lwip_bridge_tcp_complete_accept(pcb) to emit
+             the SYN-ACK, or lwip_bridge_tcp_reject_accept(pcb) to send RST.
+2 (REJECT) → tcp_abandon(npcb, 1). RST in response to the SYN, free PCB.
+```
+
+**Why:** Without the hook, every accepted TUN connection completes the inner
+3-way handshake before we know whether upstream is reachable. Subsequent
+upstream connect failures then surface to the local app as a mid-stream RST,
+which TLS/HTTP/speedtest clients treat as transient and retry against —
+defeating routing rules and amplifying log noise. Deferring SYN-ACK lets a
+connect failure be reported to the client's TCP stack as a SYN-time RST,
+which `connect(2)` surfaces as `ECONNREFUSED` with no retry storm.
+
+The Swift bridge picks DEFER for connections whose route is fully known at
+SYN time (fake-IP, IP-CIDR with a resolved configuration), and ALLOW for
+connections that need bytes from the local app before routing is decided
+(SNI-sniff path).
+
+**Interaction with `tcp_slowtmr`:** A SYN_RCVD PCB without SYN-ACK still
+trips `TCP_SYN_RCVD_TIMEOUT` (default 20 s, `tcp_priv.h:129`) and is
+reaped with `ERR_ABRT`. Our `TunnelConstants.handshakeTimeout` is 60 s, so
+without intervention lwIP would purge the PCB out from under an in-flight
+upstream dial. We bump `TCP_SYN_RCVD_TIMEOUT` to 75 s in
+`port/lwipopts.h` so the Swift handshake timer always wins. Existing
+`closed`-guarded async checks in `LWIPTCPConnection` already prevent
+use-after-free if the order ever inverts; this is purely about clean logs.
+
+**Interaction with `tcp_process` SYN_RCVD case:** A SYN retransmit on a
+deferred PCB hits `tcp_process` `case SYN_RCVD: if (flags & TCP_SYN) … →
+tcp_rexmit(pcb)`. With no segments queued, `tcp_rexmit` is a harmless
+no-op, so we silently absorb client SYN retries until either complete or
+reject is called.
+
+**What is unaffected:**
+
+- The legacy late `tcp_accept_cb` path still works when no pre-accept
+  handler is registered (the hook returns ALLOW by default).
+- All SYN_RCVD → ESTABLISHED bookkeeping in `tcp_process` is unchanged —
+  the late accept callback fires after the client's ACK as always; in the
+  deferred path it's a stub that returns `ERR_OK` because pre-accept already
+  wired `tcp_arg`/`tcp_recv`/`tcp_sent`/`tcp_err`.
+- ALLOW paths reach `tcp_enqueue_flags(npcb, TCP_SYN | TCP_ACK)` exactly
+  as before.
+
+**Upgrade notes:** When bumping the vendored lwIP version, re-apply this
+block. Search for the second occurrence of `tcp_enqueue_flags(npcb, TCP_SYN
+| TCP_ACK)` in `src/core/tcp_in.c`; it lives inside `tcp_listen_input` just
+after the `LWIP_TCP_PCB_NUM_EXT_ARGS` block. Also re-check the
+`TCP_SYN_RCVD_TIMEOUT` override in `port/lwipopts.h` and the `#ifndef`
+guard in `src/include/lwip/priv/tcp_priv.h`.
+
+---
+
+### 3. `src/include/lwip/priv/tcp_priv.h` — `#ifndef`-guard timeout overrides
+
+**What:** Wrap `TCP_FIN_WAIT_TIMEOUT` and `TCP_SYN_RCVD_TIMEOUT` in
+`#ifndef` so `lwipopts.h` overrides actually take effect.
+
+```c
+/* before */
+#define TCP_FIN_WAIT_TIMEOUT 20000 /* milliseconds */
+#define TCP_SYN_RCVD_TIMEOUT 20000 /* milliseconds */
+
+/* after */
+#ifndef TCP_FIN_WAIT_TIMEOUT
+#define TCP_FIN_WAIT_TIMEOUT 20000 /* milliseconds */
+#endif
+#ifndef TCP_SYN_RCVD_TIMEOUT
+#define TCP_SYN_RCVD_TIMEOUT 20000 /* milliseconds */
+#endif
+```
+
+**Why:** The deferred SYN-ACK patch above relies on `TCP_SYN_RCVD_TIMEOUT`
+being raised above `TunnelConstants.handshakeTimeout` (60 s) so the Swift
+handshake timer fires before lwIP's `tcp_slowtmr` reaper. Without this
+guard, the override in `port/lwipopts.h` is silently overwritten by the
+unconditional `#define` in `tcp_priv.h`, producing a `-Wmacro-redefined`
+warning and the original 20 s timeout taking effect. Functionally the
+deferred path still tears down cleanly via `tcp_err` → `handleError`, but
+the visible log line becomes `[TCP] lwIP aborted connection: ERR_ABRT`
+instead of `[TCP] Handshake timeout during proxy dial`.
+
+**Upgrade notes:** Re-apply when bumping lwIP — both timeout macros lack
+guards in upstream.
+
+---
+
+### 4. `src/include/lwip/priv/tcp_priv.h` — disable delayed ACK
 
 **What:** Redefine the `tcp_ack` macro to always queue an immediate
 ACK (`TF_ACK_NOW`) instead of the stretch-ACK pattern that ACKs every
