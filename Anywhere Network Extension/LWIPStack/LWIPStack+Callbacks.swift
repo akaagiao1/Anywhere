@@ -112,6 +112,17 @@ extension LWIPStack {
             // surface as a clean ECONNREFUSED.
             let deferAccept = !sniffSNI
 
+            shared.logTrafficRoute(
+                proto: "TCP",
+                srcHost: LWIPStack.ipAddrToString(srcIP, isIPv6: isIPv6 != 0),
+                srcPort: srcPort,
+                dstHost: dstHost,
+                dstPort: dstPort,
+                forceBypass: forceBypass,
+                configuration: connectionConfiguration,
+                sniffSNI: sniffSNI
+            )
+
             let connection = LWIPTCPConnection(
                 pcb: pcb,
                 dstHost: dstHost,
@@ -279,9 +290,38 @@ extension LWIPStack {
                 forceBypass: forceBypass,
                 lwipQueue: shared.lwipQueue
             )
+            shared.logTrafficRoute(
+                proto: "UDP",
+                srcHost: srcHost,
+                srcPort: srcPort,
+                dstHost: dstHost,
+                dstPort: dstPort,
+                forceBypass: forceBypass,
+                configuration: flowConfiguration,
+                sniffSNI: false
+            )
             shared.udpFlows[flowKey] = flow
             flow.handleReceivedData(payload, payloadLength: Int(len))
         }
+    }
+
+    private func logTrafficRoute(
+        proto: String,
+        srcHost: String,
+        srcPort: UInt16,
+        dstHost: String,
+        dstPort: UInt16,
+        forceBypass: Bool,
+        configuration: ProxyConfiguration,
+        sniffSNI: Bool
+    ) {
+        let route = if forceBypass {
+            "DIRECT"
+        } else {
+            "PROXY(\(configuration.name))"
+        }
+        let sniffSuffix = sniffSNI ? ", SNI-SNIFF" : ""
+        logger.info("[\(proto)] Route: \(srcHost):\(srcPort) -> \(dstHost):\(dstPort) => \(route)\(sniffSuffix)")
     }
 
     // MARK: - Fake-IP Resolution
