@@ -25,11 +25,34 @@ class RuleSetStore: ObservableObject {
         let id: UUID
         var name: String
         var rules: [DomainRule]
+        var remoteSubscriptionURL: String?
+        var remoteUpdateIntervalHours: Int
+        var lastRemoteUpdate: Date?
 
-        init(name: String, rules: [DomainRule] = []) {
+        init(
+            name: String,
+            rules: [DomainRule] = [],
+            remoteSubscriptionURL: String? = nil,
+            remoteUpdateIntervalHours: Int = 24,
+            lastRemoteUpdate: Date? = nil
+        ) {
             self.id = UUID()
             self.name = name
             self.rules = rules
+            self.remoteSubscriptionURL = remoteSubscriptionURL
+            self.remoteUpdateIntervalHours = max(1, remoteUpdateIntervalHours)
+            self.lastRemoteUpdate = lastRemoteUpdate
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(UUID.self, forKey: .id)
+            name = try container.decode(String.self, forKey: .name)
+            rules = try container.decodeIfPresent([DomainRule].self, forKey: .rules) ?? []
+            remoteSubscriptionURL = try container.decodeIfPresent(String.self, forKey: .remoteSubscriptionURL)
+            let hours = try container.decodeIfPresent(Int.self, forKey: .remoteUpdateIntervalHours) ?? 24
+            remoteUpdateIntervalHours = max(1, hours)
+            lastRemoteUpdate = try container.decodeIfPresent(Date.self, forKey: .lastRemoteUpdate)
         }
     }
 
@@ -156,6 +179,17 @@ class RuleSetStore: ObservableObject {
         rebuildRuleSets()
     }
 
+    func updateCustomRuleSetRemoteSubscription(_ id: UUID, url: String?) {
+        guard let index = customRuleSets.firstIndex(where: { $0.id == id }) else { return }
+        let trimmed = url?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        customRuleSets[index].remoteSubscriptionURL = trimmed.isEmpty ? nil : trimmed
+        if trimmed.isEmpty {
+            customRuleSets[index].lastRemoteUpdate = nil
+        }
+        saveCustomRuleSets()
+        rebuildRuleSets()
+    }
+
     func addRule(to customRuleSetId: UUID, rule: DomainRule) {
         guard let index = customRuleSets.firstIndex(where: { $0.id == customRuleSetId }) else { return }
         customRuleSets[index].rules.append(rule)
@@ -179,6 +213,59 @@ class RuleSetStore: ObservableObject {
 
     func customRuleSet(for id: UUID) -> CustomRuleSet? {
         customRuleSets.first { $0.id == id }
+    }
+
+    /// Pulls all remote custom rule set subscriptions if their update interval has elapsed.
+    /// Returns `true` when at least one rule set changed.
+    func refreshRemoteRuleSetsIfNeeded() async -> Bool {
+        guard !customRuleSets.isEmpty else { return false }
+        var changed = false
+
+        for custom in customRuleSets {
+            guard let urlString = custom.remoteSubscriptionURL,
+                  !urlString.isEmpty else { continue }
+
+            let interval = TimeInterval(custom.remoteUpdateIntervalHours * 3600)
+            if let last = custom.lastRemoteUpdate,
+               Date().timeIntervalSince(last) < interval {
+                continue
+            }
+
+            guard let url = URL(string: urlString) else {
+                logger.warning("[RuleSetStore] Invalid custom rules subscription URL: \(urlString)")
+                continue
+            }
+
+            do {
+                let (data, response) = try await URLSession.shared.data(from: url)
+                if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                    logger.warning("[RuleSetStore] Remote custom rules update failed: HTTP \(http.statusCode) (\(custom.name))")
+                    continue
+                }
+                guard let body = String(data: data, encoding: .utf8) else {
+                    logger.warning("[RuleSetStore] Remote custom rules update failed: invalid text encoding (\(custom.name))")
+                    continue
+                }
+                let parsed = Self.parseRules(body)
+                guard !parsed.isEmpty else {
+                    logger.warning("[RuleSetStore] Remote custom rules update yielded 0 rules (\(custom.name))")
+                    continue
+                }
+
+                guard let index = customRuleSets.firstIndex(where: { $0.id == custom.id }) else { continue }
+                customRuleSets[index].rules = parsed
+                customRuleSets[index].lastRemoteUpdate = Date()
+                changed = true
+            } catch {
+                logger.warning("[RuleSetStore] Remote custom rules update failed (\(custom.name)): \(error.localizedDescription)")
+            }
+        }
+
+        if changed {
+            saveCustomRuleSets()
+            rebuildRuleSets()
+        }
+        return changed
     }
 
     // MARK: - Rules
@@ -294,6 +381,34 @@ class RuleSetStore: ObservableObject {
     private func saveCustomRuleSets() {
         if let data = try? JSONEncoder().encode(customRuleSets) {
             AWCore.setCustomRuleSetsData(data)
+        }
+    }
+
+    private static func parseRules(_ text: String) -> [DomainRule] {
+        text
+            .components(separatedBy: .newlines)
+            .compactMap { parseRuleLine($0) }
+    }
+
+    private static func parseRuleLine(_ line: String) -> DomainRule? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.hasPrefix("#") || trimmed.hasPrefix("//") { return nil }
+
+        guard let commaIndex = trimmed.firstIndex(of: ",") else { return nil }
+        let prefix = trimmed[trimmed.startIndex..<commaIndex].trimmingCharacters(in: .whitespaces)
+        let value = trimmed[trimmed.index(after: commaIndex)...].trimmingCharacters(in: .whitespaces)
+        guard !value.isEmpty, let typeInt = Int(prefix), let type = DomainRuleType(rawValue: typeInt) else {
+            return nil
+        }
+
+        switch type {
+        case .ipCIDR:
+            return DomainRule(type: type, value: value.contains("/") ? value : value + "/32")
+        case .ipCIDR6:
+            return DomainRule(type: type, value: value.contains("/") ? value : value + "/128")
+        case .domainSuffix, .domainKeyword:
+            return DomainRule(type: type, value: value)
         }
     }
 }

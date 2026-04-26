@@ -109,6 +109,12 @@ struct RuleSetListView: View {
         .onAppear {
             builtInServiceRuleSets = RuleSetStore.shared.builtInServiceRuleSets
             customRuleSets = RuleSetStore.shared.customRuleSets
+            Task {
+                if await RuleSetStore.shared.refreshRemoteRuleSetsIfNeeded() {
+                    customRuleSets = RuleSetStore.shared.customRuleSets
+                    await viewModel.syncRoutingConfigurationToNE()
+                }
+            }
         }
         .alert("New Rule Set", isPresented: $showAddSheet) {
             TextField("Name", text: $newRuleSetName)

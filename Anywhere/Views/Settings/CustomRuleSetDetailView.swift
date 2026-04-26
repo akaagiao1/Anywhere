@@ -16,6 +16,8 @@ struct CustomRuleSetDetailView: View {
     @State private var showImportSheet = false
     @State private var showRenameAlert = false
     @State private var renameText = ""
+    @State private var remoteURLText = ""
+    @State private var remoteSyncing = false
 
     private var customRuleSet: RuleSetStore.CustomRuleSet? {
         ruleSetStore.customRuleSet(for: customRuleSetId)
@@ -41,6 +43,30 @@ struct CustomRuleSetDetailView: View {
             if let ruleSet {
                 Section {
                     assignmentPicker(for: ruleSet)
+                }
+            }
+
+            Section("Remote Subscription") {
+                TextField("Anywhere Rule List URL", text: $remoteURLText)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .keyboardType(.URL)
+                Button("Save Subscription URL") {
+                    ruleSetStore.updateCustomRuleSetRemoteSubscription(customRuleSetId, url: remoteURLText)
+                }
+                if let customRuleSet, customRuleSet.remoteSubscriptionURL != nil {
+                    Button(remoteSyncing ? "Updating..." : "Update Now") {
+                        Task { await refreshRemoteRules(forceSyncToNE: true) }
+                    }
+                    .disabled(remoteSyncing)
+                    Text("Auto updates every 24 hours.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if let last = customRuleSet.lastRemoteUpdate {
+                        Text("Last update: \(last.formatted(.dateTime.year().month().day().hour().minute()))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
@@ -94,6 +120,21 @@ struct CustomRuleSetDetailView: View {
             }
             Button("Cancel", role: .cancel) {}
         }
+        .onAppear {
+            remoteURLText = customRuleSet?.remoteSubscriptionURL ?? ""
+            Task { await refreshRemoteRules(forceSyncToNE: false) }
+        }
+    }
+
+    private func refreshRemoteRules(forceSyncToNE: Bool) async {
+        guard !remoteSyncing else { return }
+        remoteSyncing = true
+        let changed = await ruleSetStore.refreshRemoteRuleSetsIfNeeded()
+        if changed || forceSyncToNE {
+            await viewModel.syncRoutingConfigurationToNE()
+        }
+        remoteURLText = customRuleSet?.remoteSubscriptionURL ?? ""
+        remoteSyncing = false
     }
 
     private func ruleRow(_ rule: DomainRule) -> some View {
